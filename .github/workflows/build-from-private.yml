@@ -1,0 +1,247 @@
+name: Build from private (free — public minutes)
+
+# Собирает Windows-бету, БЕРЯ исходник из ПРИВАТНОГО notageek88/youtube-mashina
+# (checkout по PRIVATE_SRC_PAT, исходник живёт только во временном раннере — в
+# git публичного репо НЕ попадает). Запускается в ПУБЛИЧНОМ YouTubeMashina, где
+# Actions-минуты безлимитны. Нужно когда у приватного репо кончились минуты.
+#
+# Секреты (в этом, публичном, репо):
+#   PRIVATE_SRC_PAT             — fine-grained PAT, Contents:Read на youtube-mashina
+#   MASHINA_FLAVOUR_PRIVKEY_HEX — Ed25519 seed подписи tier-блоба
+# Tauri-подпись (.sig) ОТКЛЮЧЕНА (createUpdaterArtifacts=false) — апдейтер у нас
+# Python (sha256), Tauri-ключ не нужен.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Тег/ветка приватного репо (напр. v2.10.6-beta)"
+        required: true
+        default: "v2.10.6-beta"
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: notageek88/youtube-mashina
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_SRC_PAT }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "nuitka" "pyarmor==9.0.5" cryptography
+
+      - name: Protect core — Nuitka native + PyArmor + enterprise blob
+        shell: bash
+        env:
+          MASHINA_FLAVOUR_PRIVKEY_HEX: ${{ secrets.MASHINA_FLAVOUR_PRIVKEY_HEX }}
+        run: |
+          set -e
+          python installer/build_flavour_writer.py --tier enterprise --build-id "beta-${{ github.run_id }}"
+          ls -la build_flavour.blob
+          export PUBKEY=$(python -c "import os;from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey;print(Ed25519PrivateKey.from_private_bytes(bytes.fromhex(os.environ['MASHINA_FLAVOUR_PRIVKEY_HEX'].strip())).public_key().public_bytes_raw().hex())")
+          echo "derived signing pubkey: $PUBKEY"
+          python -c "import os,pathlib; p=pathlib.Path('src/build_flavour.py'); t=p.read_text(encoding='utf-8'); old='b02fd7a4791db6a32c20d738c5477cc929053bc3e0c5905e372a9edf694212ef'; t2=t.replace(old, os.environ['PUBKEY']); assert t2!=t, 'pubkey default not found'; p.write_text(t2, encoding='utf-8'); print('[patch] build_flavour verify pubkey ->', os.environ['PUBKEY'])"
+          mkdir -p build/protected
+          for m in tier_manager license_manager license_ed25519 build_flavour; do
+            echo "--- Nuitka --module src/$m.py ---"
+            python -m nuitka --mode=module --output-dir=build/protected --remove-output \
+              --assume-yes-for-downloads --quiet "src/$m.py"
+          done
+          ls build/protected
+          mkdir -p build/obfuscated
+          pyarmor gen --output build/obfuscated --recursive \
+            src/jwt_auth.py src/depth_estimator.py src/face_detection.py src/character_registry.py \
+            src/camera_presets.py src/thumbnail_engine.py src/ai_disclosure.py src/smart_ken_burns.py \
+            src/fact_checker.py src/prompt_utils.py src/youtube_uploader.py src/clone_visual.py
+          ls build/obfuscated
+          for m in tier_manager license_manager license_ed25519 build_flavour; do
+            rm -f "src/$m.py"
+            cp build/protected/$m.*.pyd "src/" 2>/dev/null \
+              || cp build/protected/$m.*.so "src/" 2>/dev/null \
+              || { echo "::error::missing Nuitka output for $m"; exit 1; }
+          done
+          for m in jwt_auth depth_estimator face_detection character_registry \
+                   camera_presets thumbnail_engine ai_disclosure smart_ken_burns \
+                   fact_checker prompt_utils youtube_uploader clone_visual; do
+            cp "build/obfuscated/$m.py" "src/$m.py"
+          done
+          ls src/ | grep -E "^(tier_manager|license_manager|license_ed25519|build_flavour)\." || true
+
+      - name: Bundle ffmpeg + ffprobe (Windows static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "data/bin" | Out-Null
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Write-Host "downloading ffmpeg (gyan.dev)..."
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted -Force
+          $binDir = Get-ChildItem ffmpeg-extracted -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
+          if (-not $binDir) { throw "ffmpeg.exe not found in archive" }
+          Copy-Item "$binDir/ffmpeg.exe"  "data/bin/ffmpeg.exe"  -Force
+          Copy-Item "$binDir/ffprobe.exe" "data/bin/ffprobe.exe" -Force
+          Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg-extracted
+          Get-ChildItem "data/bin" | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Build backend sidecar (PyInstaller)
+        shell: bash
+        run: pwsh scripts/build_backend.ps1
+
+      - name: Verify backend — tier=enterprise + protected modules load
+        shell: pwsh
+        run: |
+          $env:YM_BACKEND_PORT = "5783"
+          $env:YM_NO_WEBVIEW = "1"
+          $proc = Start-Process -FilePath "dist\youtube-mashina-backend\youtube-mashina-backend.exe" -PassThru
+          Start-Sleep -Seconds 25
+          try {
+            $resp = (Invoke-WebRequest -Uri "http://127.0.0.1:5783/api/tier/current" -TimeoutSec 8 -UseBasicParsing).Content
+            Write-Host "tier response: $resp"
+            if ($resp -notmatch "enterprise") { throw "tier is NOT enterprise: $resp" }
+            Write-Host "[OK] tier=enterprise confirmed"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Disable Tauri updater artifacts (нет signing key в этом репо)
+        shell: bash
+        run: |
+          python -c "import json; p='ui/src-tauri/tauri.conf.json'; d=json.load(open(p,encoding='utf-8')); d.setdefault('bundle',{})['createUpdaterArtifacts']=False; json.dump(d,open(p,'w',encoding='utf-8'),indent=2,ensure_ascii=False); print('createUpdaterArtifacts -> false')"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci || npm install
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/src-tauri
+
+      - name: Stage backend + extension into Tauri resources
+        shell: bash
+        run: |
+          mkdir -p ui/src-tauri/resources
+          cp -r dist/youtube-mashina-backend/. ui/src-tauri/resources/
+          cp -r ui/extension ui/src-tauri/resources/extension
+          echo "=== resources (top level) ===" ; ls -la ui/src-tauri/resources
+          echo "=== enterprise blob (must exist) ===" ; ls -la ui/src-tauri/resources/_internal/build_flavour.blob
+          ls ui/src-tauri/resources/_internal/ | grep -Ei "tier_manager|license_manager|license_ed25519|build_flavour|pyarmor_runtime" || echo "WARN: protected modules not visible"
+          ls ui/src-tauri/resources/extension
+
+      - name: Build Tauri app
+        working-directory: ui
+        run: npx tauri build --target x86_64-pc-windows-msvc
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $relDir = "ui/src-tauri/target/x86_64-pc-windows-msvc/release"
+          $exe = Get-ChildItem "$relDir" -Filter *.exe -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -notmatch 'setup|installer' } | Select-Object -First 1
+          if (-not $exe) { throw "tauri exe not found in $relDir" }
+          $port = "portable/YouTube MASHINA"
+          New-Item -ItemType Directory -Force -Path "$port/resources" | Out-Null
+          Copy-Item $exe.FullName "$port/"
+          Copy-Item -Recurse "ui/src-tauri/resources/*" "$port/resources/"
+          $wv = Join-Path $relDir "WebView2Loader.dll"
+          if (Test-Path $wv) { Copy-Item $wv "$port/" }
+          if (Test-Path "Документация") { Copy-Item -Recurse "Документация" (Join-Path $port "Документация") -Force }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path "portable/*" -DestinationPath "release/YouTube-MASHINA-portable-windows-x64.zip" -Force
+          Get-ChildItem release/*.zip | Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB,0)}}
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          find ui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle \
+               \( -name "*.msi" -o -name "*.exe" \) -exec cp {} release/ \; || true
+          for f in "Документация"/*.pdf; do
+            [ -e "$f" ] || continue
+            case "$f" in
+              *API*) cp "$f" "release/YouTube-MASHINA-API-Keys-Setup-RU.pdf" ;;
+              *)     cp "$f" "release/YouTube-MASHINA-User-Guide-RU.pdf" ;;
+            esac
+          done
+          ls -la release/
+
+      - name: Publish assets to release (this PUBLIC repo)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ inputs.ref }}"
+          repo="notageek88/YouTubeMashina"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --draft --prerelease --title "$tag" --generate-notes || true
+          fi
+          echo "Assets:"; ls -la release/
+          gh release upload "$tag" release/* --repo "$repo" --clobber
+
+  manifest:
+    name: Publish update manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate + publish update.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ inputs.ref }}"
+          repo="notageek88/YouTubeMashina"
+          ver="${tag#v}"; ver="${ver%-beta}"
+          base="https://github.com/$repo/releases/download/$tag"
+          mkdir -p dl
+          gh release download "$tag" --repo "$repo" --dir dl --pattern '*x64-setup.exe' || true
+          win=$(ls dl/*x64-setup.exe 2>/dev/null | head -1 || true)
+          if [ -z "$win" ]; then echo "::error::windows setup.exe not found"; exit 1; fi
+          sha=$(sha256sum "$win" | cut -d' ' -f1)
+          size=$(stat -c%s "$win")
+          url="$base/$(basename "$win")"
+          pubdate=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq -n --arg v "$ver" --arg url "$url" --arg sha "$sha" --argjson size "$size" \
+                --arg date "$pubdate" --arg notes "YouTube MASHINA $ver. Подробности: $base" \
+                '{version:$v, changelog:$notes, download_url:$url, sha256:$sha, size_bytes:$size, published_at:$date,
+                  platforms:{"windows-x86_64":{url:$url, sha256:$sha, size_bytes:$size}}}' > update.json
+          echo "=== update.json ==="; cat update.json
+          existing=$(gh api repos/$repo/contents/update.json --jq .sha 2>/dev/null || true)
+          b64=$(base64 -w0 update.json)
+          if [ -n "$existing" ]; then
+            gh api repos/$repo/contents/update.json -X PUT -f message="update manifest $tag" -f content="$b64" -f branch=main -f sha="$existing"
+          else
+            gh api repos/$repo/contents/update.json -X PUT -f message="update manifest $tag" -f content="$b64" -f branch=main
+          fi
+          echo "manifest published"
