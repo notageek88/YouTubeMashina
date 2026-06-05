@@ -1,0 +1,25 @@
+{
+  "version": "2.10.5",
+  "changelog": "YouTube MASHINA 2.10.5: монтаж на любой видеокарте (NVENC-детект), исправлен белый экран, рабочее авто-обновление. Подробности: https://github.com/notageek88/YouTubeMashina/releases",
+  "download_url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.5-beta/YouTube.MASHINA_2.10.5_x64-setup.exe",
+  "sha256": "b1c261f95812ef949c90fd23c19e3d3343857143bd38888292502534a3b2a36d",
+  "size_bytes": 359689858,
+  "published_at": "2026-06-05T12:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.5-beta/YouTube.MASHINA_2.10.5_x64-setup.exe",
+      "sha256": "b1c261f95812ef949c90fd23c19e3d3343857143bd38888292502534a3b2a36d",
+      "size_bytes": 359689858
+    },
+    "darwin-aarch64": {
+      "url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.5-beta/YouTube.MASHINA_2.10.5_aarch64.dmg",
+      "sha256": "d9103496775b02e3a9292d99c85affd32bc6b4b61a1ebc29ee6f2c61e33ad1f1",
+      "size_bytes": 192399035
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.5-beta/YouTube.MASHINA_2.10.5_x64.dmg",
+      "sha256": "82086ec827dc5b8170359946da243fa844d261695ffde42587fa0ef56376f40c",
+      "size_bytes": 192578339
+    }
+  }
+}
