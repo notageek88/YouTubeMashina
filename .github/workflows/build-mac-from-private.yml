@@ -1,0 +1,229 @@
+name: Build Mac FULL from private (free — public minutes)
+
+# Собирает ПОЛНУЮ бету (enterprise) под macOS arm64, БЕРЯ исходник из ПРИВАТНОГО
+# notageek88/youtube-mashina (checkout по PRIVATE_SRC_PAT). Запускается в ПУБЛИЧНОМ
+# YouTubeMashina, где Actions-минуты (включая macOS) безлимитны. Нужно когда у
+# приватного репо кончились минуты.
+#
+# Секреты (в этом, публичном, репо — те же что у build-from-private.yml):
+#   PRIVATE_SRC_PAT             — fine-grained PAT, Contents:Read на youtube-mashina
+#   MASHINA_FLAVOUR_PRIVKEY_HEX — Ed25519 seed подписи tier-блоба
+#
+# Output: youtube-mashina-full-macos-arm64.dmg → дозаливается ассетом в
+# существующий релиз inputs.ref публичного репо (рядом с Windows-сборкой).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Тег/ветка приватного репо (напр. v2.10.8-beta)"
+        required: true
+        default: "v2.10.8-beta"
+
+jobs:
+  build-mac:
+    name: Build macOS arm64 FULL
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: notageek88/youtube-mashina
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_SRC_PAT }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-full.txt
+
+      - name: Install system dependencies (ffmpeg + create-dmg)
+        run: brew install ffmpeg create-dmg
+
+      - name: Install Python dependencies (FULL — torch + whisper + librosa)
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements-full.txt
+          pip install pyinstaller nuitka cryptography
+          pip list | grep -iE "(torch|whisper|librosa|demucs|opencv|onnxruntime|scipy|cryptography|nuitka|pyinstaller)" || true
+
+      - name: Protect core — Nuitka native + enterprise blob (pubkey patched)
+        env:
+          MASHINA_FLAVOUR_PRIVKEY_HEX: ${{ secrets.MASHINA_FLAVOUR_PRIVKEY_HEX }}
+        run: |
+          set -e
+          if [ -z "$MASHINA_FLAVOUR_PRIVKEY_HEX" ]; then
+            echo "::error::Secret MASHINA_FLAVOUR_PRIVKEY_HEX is not set."; exit 1
+          fi
+          python installer/build_flavour_writer.py --tier enterprise --build-id "${{ inputs.ref }}-$(date +%Y%m%d-%H%M%S)"
+          ls -la build_flavour.blob
+          export PUBKEY=$(python -c "import os;from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey;print(Ed25519PrivateKey.from_private_bytes(bytes.fromhex(os.environ['MASHINA_FLAVOUR_PRIVKEY_HEX'].strip())).public_key().public_bytes_raw().hex())")
+          echo "derived signing pubkey: $PUBKEY"
+          python -c "import os,pathlib; p=pathlib.Path('src/build_flavour.py'); t=p.read_text(encoding='utf-8'); old='b02fd7a4791db6a32c20d738c5477cc929053bc3e0c5905e372a9edf694212ef'; t2=t.replace(old, os.environ['PUBKEY']); assert t2!=t, 'pubkey default not found'; p.write_text(t2, encoding='utf-8'); print('[patch] build_flavour verify pubkey ->', os.environ['PUBKEY'])"
+          mkdir -p build/protected
+          for m in tier_manager license_manager license_ed25519 build_flavour; do
+            echo "--- Nuitka --module src/$m.py ---"
+            python -m nuitka --mode=module --output-dir=build/protected --remove-output \
+              --assume-yes-for-downloads --quiet "src/$m.py"
+          done
+          ls build/protected
+          for m in tier_manager license_manager license_ed25519 build_flavour; do
+            rm -f "src/$m.py"
+            cp build/protected/$m.*.so "src/" || { echo "::error::missing Nuitka output for $m"; exit 1; }
+          done
+          ls src/ | grep -E "^(tier_manager|license_manager|license_ed25519|build_flavour)\." || true
+
+      - name: Seed configs/config.py from template (gitignored, so absent in CI)
+        run: |
+          if [ ! -f configs/config.py ]; then
+            cp configs/config.example.py configs/config.py
+            echo "seeded configs/config.py from template ($(wc -l < configs/config.py) lines)"
+          fi
+
+      - name: Bundle ffmpeg + ffprobe + dylibs (self-contained for end-user Mac)
+        run: |
+          set -e
+          mkdir -p data/bin
+          FFMPEG=$(python3 -c "import os; print(os.path.realpath('$(which ffmpeg)'))")
+          FFPROBE=$(python3 -c "import os; print(os.path.realpath('$(which ffprobe)'))")
+          cp "$FFMPEG"  data/bin/ffmpeg
+          cp "$FFPROBE" data/bin/ffprobe
+          chmod +w data/bin/ffmpeg data/bin/ffprobe
+
+          python3 << 'PYEOF'
+          import os, re, shutil, subprocess
+          DEST = os.path.abspath("data/bin")
+          BREW_PATTERN = re.compile(r"^(/opt/homebrew|/usr/local/Cellar|/usr/local/opt)/")
+
+          def otool_L(path):
+              out = subprocess.check_output(["otool", "-L", path], text=True)
+              deps = []
+              for line in out.splitlines()[1:]:
+                  m = re.match(r"\s+(\S+)", line)
+                  if m: deps.append(m.group(1))
+              return deps
+
+          def needs_bundling(dep_path):
+              return BREW_PATTERN.match(dep_path) is not None
+
+          ffmpeg_orig  = os.path.realpath(subprocess.check_output(["which", "ffmpeg"], text=True).strip())
+          ffprobe_orig = os.path.realpath(subprocess.check_output(["which", "ffprobe"], text=True).strip())
+
+          visited = set()
+          def walk_deps(brew_path):
+              if brew_path in visited: return
+              visited.add(brew_path)
+              name = os.path.basename(brew_path)
+              dst = os.path.join(DEST, name)
+              if not os.path.exists(dst):
+                  shutil.copy2(brew_path, dst)
+                  os.chmod(dst, 0o755)
+              for dep in otool_L(brew_path):
+                  if needs_bundling(dep) and os.path.exists(dep):
+                      walk_deps(dep)
+
+          walk_deps(ffmpeg_orig)
+          walk_deps(ffprobe_orig)
+          print(f"\nPass 1: copied {len(visited)} files to data/bin/")
+
+          for fname in sorted(os.listdir(DEST)):
+              dst = os.path.join(DEST, fname)
+              if fname.endswith(".dylib"):
+                  subprocess.run(["install_name_tool", "-id", f"@loader_path/{fname}", dst], check=False)
+              for dep in otool_L(dst):
+                  if needs_bundling(dep):
+                      dep_name = os.path.basename(dep)
+                      subprocess.run(
+                          ["install_name_tool", "-change", dep, f"@loader_path/{dep_name}", dst],
+                          check=False
+                      )
+          print(f"Pass 2: rewrote install_name on all files")
+
+          files = sorted(os.listdir(DEST))
+          total = sum(os.path.getsize(os.path.join(DEST, f)) for f in files)
+          print(f"\n=== data/bin/ ({len(files)} files, {total/1024/1024:.0f} MB) ===")
+          for f in files:
+              sz = os.path.getsize(os.path.join(DEST, f))
+              print(f"  {sz/1024/1024:>6.1f} MB  {f}")
+          PYEOF
+
+          unset DYLD_LIBRARY_PATH
+          ./data/bin/ffmpeg  -version | head -1
+          ./data/bin/ffprobe -version | head -1
+          echo "=== otool check (should be @loader_path only) ==="
+          otool -L ./data/bin/ffmpeg | head -10
+
+      - name: Build backend (PyInstaller, arm64, FULL spec)
+        run: |
+          pyinstaller --clean --noconfirm installer/youtube_mashina_full.spec
+          ls -la dist/
+          du -sh dist/youtube-mashina-full
+
+      - name: Verify exe runs and reports tier=enterprise
+        run: |
+          export YM_BACKEND_PORT=5782
+          export YM_NO_WEBVIEW=1
+          ./dist/youtube-mashina-full/youtube-mashina-full &
+          BACKEND_PID=$!
+          sleep 20
+          echo "=== /api/tier/current ==="
+          TIER_RESP=$(curl -sS --max-time 5 "http://127.0.0.1:5782/api/tier/current" || echo "no response")
+          echo "$TIER_RESP"
+          if echo "$TIER_RESP" | grep -q "enterprise"; then
+            echo "✓ tier=enterprise confirmed"
+          else
+            echo "✗ tier mismatch — FULL build did not resolve to enterprise"
+            kill -9 $BACKEND_PID 2>/dev/null || true
+            exit 1
+          fi
+          kill -9 $BACKEND_PID 2>/dev/null || true
+          wait $BACKEND_PID 2>/dev/null || true
+
+      - name: Package as .dmg
+        run: |
+          mkdir -p dmg-staging
+          cp -r dist/youtube-mashina-full dmg-staging/
+          mv dmg-staging/youtube-mashina-full dmg-staging/YouTubeMashinaFull
+          create-dmg \
+            --volname "YouTube MASHINA FULL" \
+            --window-pos 200 120 \
+            --window-size 700 450 \
+            --icon-size 100 \
+            --app-drop-link 525 225 \
+            --no-internet-enable \
+            "youtube-mashina-full-macos-arm64.dmg" \
+            dmg-staging/ || {
+              echo "create-dmg failed, falling back to zip"
+              cd dmg-staging && zip -9 -r ../youtube-mashina-full-macos-arm64.zip YouTubeMashinaFull && cd ..
+            }
+          ls -lh youtube-mashina-full-macos-arm64.* || true
+
+      - name: Upload as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-mashina-full-macos-arm64
+          path: |
+            youtube-mashina-full-macos-arm64.dmg
+            youtube-mashina-full-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish DMG to PUBLIC release (this repo)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ inputs.ref }}"
+          repo="notageek88/YouTubeMashina"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --prerelease --title "$tag" --generate-notes || true
+          fi
+          ASSET=$(ls youtube-mashina-full-macos-arm64.dmg 2>/dev/null || ls youtube-mashina-full-macos-arm64.zip)
+          echo "Uploading $ASSET to $repo release $tag"
+          gh release upload "$tag" "$ASSET" --repo "$repo" --clobber
