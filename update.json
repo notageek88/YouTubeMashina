@@ -1,15 +1,15 @@
 {
-  "version": "2.10.7",
-  "changelog": "YouTube MASHINA 2.10.7. Подробности: https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.7-beta",
-  "download_url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.7-beta/YouTube.MASHINA_2.10.6_x64-setup.exe",
-  "sha256": "17bc5bd381d467fe9fa0daa0a6f3da589681df78e27bf3eba9d588a30a9c1d87",
-  "size_bytes": 359448456,
-  "published_at": "2026-06-08T11:15:46Z",
+  "version": "2.10.8",
+  "changelog": "YouTube MASHINA 2.10.8. Подробности: https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.8-beta",
+  "download_url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.8-beta/YouTube.MASHINA_2.10.6_x64-setup.exe",
+  "sha256": "acec850d08a81c24206e465438181dfc5532124661c23709820577f645f9d223",
+  "size_bytes": 359464464,
+  "published_at": "2026-06-08T11:50:47Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.7-beta/YouTube.MASHINA_2.10.6_x64-setup.exe",
-      "sha256": "17bc5bd381d467fe9fa0daa0a6f3da589681df78e27bf3eba9d588a30a9c1d87",
-      "size_bytes": 359448456
+      "url": "https://github.com/notageek88/YouTubeMashina/releases/download/v2.10.8-beta/YouTube.MASHINA_2.10.6_x64-setup.exe",
+      "sha256": "acec850d08a81c24206e465438181dfc5532124661c23709820577f645f9d223",
+      "size_bytes": 359464464
     }
   }
 }
