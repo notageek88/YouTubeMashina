@@ -159,11 +159,42 @@ jobs:
           echo "=== otool check (should be @loader_path only) ==="
           otool -L ./data/bin/ffmpeg | head -10
 
+      - name: Ensure cryptography fully bundled (Nuitka .so hides its import)
+        run: |
+          python - << 'PYEOF'
+          import pathlib
+          p = pathlib.Path("installer/youtube_mashina_full.spec")
+          t = p.read_text(encoding="utf-8")
+          if "CI-cryptography-bundle" not in t:
+              inject = (
+                  "\n# CI-cryptography-bundle: build_flavour/license_ed25519 are Nuitka .so —\n"
+                  "# PyInstaller can't see their `import cryptography`, so bundle it explicitly.\n"
+                  "from PyInstaller.utils.hooks import collect_all as _ca\n"
+                  "_ca_d, _ca_b, _ca_h = _ca('cryptography')\n"
+                  "datas += _ca_d\n"
+                  "hiddenimports += _ca_h\n\n"
+              )
+              t = t.replace("a = Analysis(", inject + "a = Analysis(", 1)
+              t = t.replace("binaries=[],", "binaries=_ca_b,", 1)
+              p.write_text(t, encoding="utf-8")
+              print("patched spec: collect_all('cryptography') + binaries=_ca_b")
+          else:
+              print("spec already collects cryptography")
+          PYEOF
+
       - name: Build backend (PyInstaller, arm64, FULL spec)
         run: |
           pyinstaller --clean --noconfirm installer/youtube_mashina_full.spec
           ls -la dist/
           du -sh dist/youtube-mashina-full
+
+      - name: Diagnose bundle (blob + cryptography + build_flavour)
+        run: |
+          APP=dist/youtube-mashina-full
+          echo "=== *.blob ==="; find "$APP" -name "*.blob" || true
+          echo "=== build_flavour module ==="; find "$APP" -iname "build_flavour*" || true
+          echo "=== cryptography artefacts ==="; find "$APP" \( -iname "*cryptography*" -o -iname "*_rust*.so" -o -iname "*_rust*.abi3.so" \) | head -20 || true
+          echo "=== _internal (top) ==="; ls "$APP/_internal" 2>/dev/null | head -40 || ls "$APP" | head -40
 
       - name: Verify exe runs and reports tier=enterprise
         run: |
