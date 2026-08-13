@@ -1,260 +1,170 @@
-name: Build Mac FULL from private (free — public minutes)
-
-# Собирает ПОЛНУЮ бету (enterprise) под macOS arm64, БЕРЯ исходник из ПРИВАТНОГО
-# notageek88/youtube-mashina (checkout по PRIVATE_SRC_PAT). Запускается в ПУБЛИЧНОМ
-# YouTubeMashina, где Actions-минуты (включая macOS) безлимитны. Нужно когда у
-# приватного репо кончились минуты.
-#
-# Секреты (в этом, публичном, репо — те же что у build-from-private.yml):
-#   PRIVATE_SRC_PAT             — fine-grained PAT, Contents:Read на youtube-mashina
-#   MASHINA_FLAVOUR_PRIVKEY_HEX — Ed25519 seed подписи tier-блоба
-#
-# Output: youtube-mashina-full-macos-arm64.dmg → дозаливается ассетом в
-# существующий релиз inputs.ref публичного репо (рядом с Windows-сборкой).
+name: Build Mac from private (two DMGs)
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-mac-from-private.yml
   workflow_dispatch:
     inputs:
       ref:
-        description: "Тег/ветка приватного репо (напр. v2.10.8-beta)"
+        description: Private branch, tag, or SHA to build
         required: true
-        default: "v2.10.8-beta"
+        default: dev-last-v
 
+env:
+  PRIVATE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'afc1906f4d3e3f848b2266d93812b5633dc5e3e9' }}
 jobs:
-  build-mac:
-    name: Build macOS arm64 FULL
-    runs-on: macos-14
-    timeout-minutes: 90
-    permissions:
-      contents: write
-
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
     steps:
-      - name: Checkout PRIVATE source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: notageek88/youtube-mashina
-          ref: ${{ inputs.ref }}
+          ref: ${{ env.PRIVATE_REF }}
+          token: ${{ secrets.PRIVATE_SRC_PAT }}
+      - id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            machine: x86_64
+            target: x86_64-apple-darwin
+            deployment_target: "10.13"
+            dmg: YouTube-MASHINA-macos-x64.dmg
+          - arch: arm64
+            runner: macos-15
+            machine: arm64
+            target: aarch64-apple-darwin
+            deployment_target: "11.0"
+            dmg: YouTube-MASHINA-macos-arm64.dmg
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: notageek88/youtube-mashina
+          ref: ${{ needs.resolve.outputs.source_sha }}
           token: ${{ secrets.PRIVATE_SRC_PAT }}
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Verify native runner
+        run: |
+          test "$(uname -m)" = "${{ matrix.machine }}"
+          echo "source=$SOURCE_SHA arch=$(uname -m) target=${{ matrix.target }}"
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-full.txt
+          cache-dependency-path: requirements.txt
 
-      - name: Install system dependencies (ffmpeg + create-dmg)
-        run: brew install ffmpeg create-dmg
-
-      - name: Install Python dependencies (FULL — torch + whisper + librosa)
-        run: |
-          python -m pip install --upgrade pip wheel setuptools
-          pip install -r requirements-full.txt
-          pip install pyinstaller nuitka cryptography
-          pip list | grep -iE "(torch|whisper|librosa|demucs|opencv|onnxruntime|scipy|cryptography|nuitka|pyinstaller)" || true
-
-      - name: Protect core — Nuitka native + enterprise blob (pubkey patched)
-        env:
-          MASHINA_FLAVOUR_PRIVKEY_HEX: ${{ secrets.MASHINA_FLAVOUR_PRIVKEY_HEX }}
-        run: |
-          set -e
-          if [ -z "$MASHINA_FLAVOUR_PRIVKEY_HEX" ]; then
-            echo "::error::Secret MASHINA_FLAVOUR_PRIVKEY_HEX is not set."; exit 1
-          fi
-          python installer/build_flavour_writer.py --tier enterprise --build-id "${{ inputs.ref }}-$(date +%Y%m%d-%H%M%S)"
-          ls -la build_flavour.blob
-          export PUBKEY=$(python -c "import os;from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey;print(Ed25519PrivateKey.from_private_bytes(bytes.fromhex(os.environ['MASHINA_FLAVOUR_PRIVKEY_HEX'].strip())).public_key().public_bytes_raw().hex())")
-          echo "derived signing pubkey: $PUBKEY"
-          python -c "import os,pathlib; p=pathlib.Path('src/build_flavour.py'); t=p.read_text(encoding='utf-8'); old='b02fd7a4791db6a32c20d738c5477cc929053bc3e0c5905e372a9edf694212ef'; t2=t.replace(old, os.environ['PUBKEY']); assert t2!=t, 'pubkey default not found'; p.write_text(t2, encoding='utf-8'); print('[patch] build_flavour verify pubkey ->', os.environ['PUBKEY'])"
-          mkdir -p build/protected
-          for m in tier_manager license_manager license_ed25519 build_flavour; do
-            echo "--- Nuitka --module src/$m.py ---"
-            python -m nuitka --mode=module --output-dir=build/protected --remove-output \
-              --assume-yes-for-downloads --quiet "src/$m.py"
-          done
-          ls build/protected
-          for m in tier_manager license_manager license_ed25519 build_flavour; do
-            rm -f "src/$m.py"
-            cp build/protected/$m.*.so "src/" || { echo "::error::missing Nuitka output for $m"; exit 1; }
-          done
-          ls src/ | grep -E "^(tier_manager|license_manager|license_ed25519|build_flavour)\." || true
-
-      - name: Seed configs/config.py from template (gitignored, so absent in CI)
-        run: |
-          if [ ! -f configs/config.py ]; then
-            cp configs/config.example.py configs/config.py
-            echo "seeded configs/config.py from template ($(wc -l < configs/config.py) lines)"
-          fi
-
-      - name: Bundle ffmpeg + ffprobe + dylibs (self-contained for end-user Mac)
-        run: |
-          set -e
-          mkdir -p data/bin
-          FFMPEG=$(python3 -c "import os; print(os.path.realpath('$(which ffmpeg)'))")
-          FFPROBE=$(python3 -c "import os; print(os.path.realpath('$(which ffprobe)'))")
-          cp "$FFMPEG"  data/bin/ffmpeg
-          cp "$FFPROBE" data/bin/ffprobe
-          chmod +w data/bin/ffmpeg data/bin/ffprobe
-
-          python3 << 'PYEOF'
-          import os, re, shutil, subprocess
-          DEST = os.path.abspath("data/bin")
-          BREW_PATTERN = re.compile(r"^(/opt/homebrew|/usr/local/Cellar|/usr/local/opt)/")
-
-          def otool_L(path):
-              out = subprocess.check_output(["otool", "-L", path], text=True)
-              deps = []
-              for line in out.splitlines()[1:]:
-                  m = re.match(r"\s+(\S+)", line)
-                  if m: deps.append(m.group(1))
-              return deps
-
-          def needs_bundling(dep_path):
-              return BREW_PATTERN.match(dep_path) is not None
-
-          ffmpeg_orig  = os.path.realpath(subprocess.check_output(["which", "ffmpeg"], text=True).strip())
-          ffprobe_orig = os.path.realpath(subprocess.check_output(["which", "ffprobe"], text=True).strip())
-
-          visited = set()
-          def walk_deps(brew_path):
-              if brew_path in visited: return
-              visited.add(brew_path)
-              name = os.path.basename(brew_path)
-              dst = os.path.join(DEST, name)
-              if not os.path.exists(dst):
-                  shutil.copy2(brew_path, dst)
-                  os.chmod(dst, 0o755)
-              for dep in otool_L(brew_path):
-                  if needs_bundling(dep) and os.path.exists(dep):
-                      walk_deps(dep)
-
-          walk_deps(ffmpeg_orig)
-          walk_deps(ffprobe_orig)
-          print(f"\nPass 1: copied {len(visited)} files to data/bin/")
-
-          for fname in sorted(os.listdir(DEST)):
-              dst = os.path.join(DEST, fname)
-              if fname.endswith(".dylib"):
-                  subprocess.run(["install_name_tool", "-id", f"@loader_path/{fname}", dst], check=False)
-              for dep in otool_L(dst):
-                  if needs_bundling(dep):
-                      dep_name = os.path.basename(dep)
-                      subprocess.run(
-                          ["install_name_tool", "-change", dep, f"@loader_path/{dep_name}", dst],
-                          check=False
-                      )
-          print(f"Pass 2: rewrote install_name on all files")
-
-          files = sorted(os.listdir(DEST))
-          total = sum(os.path.getsize(os.path.join(DEST, f)) for f in files)
-          print(f"\n=== data/bin/ ({len(files)} files, {total/1024/1024:.0f} MB) ===")
-          for f in files:
-              sz = os.path.getsize(os.path.join(DEST, f))
-              print(f"  {sz/1024/1024:>6.1f} MB  {f}")
-          PYEOF
-
-          unset DYLD_LIBRARY_PATH
-          ./data/bin/ffmpeg  -version | head -1
-          ./data/bin/ffprobe -version | head -1
-          echo "=== otool check (should be @loader_path only) ==="
-          otool -L ./data/bin/ffmpeg | head -10
-
-      - name: Ensure cryptography fully bundled (Nuitka .so hides its import)
-        run: |
-          python - << 'PYEOF'
-          import pathlib
-          p = pathlib.Path("installer/youtube_mashina_full.spec")
-          t = p.read_text(encoding="utf-8")
-          if "CI-cryptography-bundle" not in t:
-              inject = (
-                  "\n# CI-cryptography-bundle: build_flavour/license_ed25519 are Nuitka .so —\n"
-                  "# PyInstaller can't see their `import cryptography`, so bundle it explicitly.\n"
-                  "from PyInstaller.utils.hooks import collect_all as _ca\n"
-                  "_ca_d, _ca_b, _ca_h = _ca('cryptography')\n"
-                  "datas += _ca_d\n"
-                  "hiddenimports += _ca_h\n\n"
-              )
-              t = t.replace("a = Analysis(", inject + "a = Analysis(", 1)
-              t = t.replace("binaries=[],", "binaries=_ca_b,", 1)
-              p.write_text(t, encoding="utf-8")
-              print("patched spec: collect_all('cryptography') + binaries=_ca_b")
-          else:
-              print("spec already collects cryptography")
-          PYEOF
-
-      - name: Build backend (PyInstaller, arm64, FULL spec)
-        run: |
-          pyinstaller --clean --noconfirm installer/youtube_mashina_full.spec
-          ls -la dist/
-          du -sh dist/youtube-mashina-full
-
-      - name: Diagnose bundle (blob + cryptography + build_flavour)
-        run: |
-          APP=dist/youtube-mashina-full
-          echo "=== *.blob ==="; find "$APP" -name "*.blob" || true
-          echo "=== build_flavour module ==="; find "$APP" -iname "build_flavour*" || true
-          echo "=== cryptography artefacts ==="; find "$APP" \( -iname "*cryptography*" -o -iname "*_rust*.so" -o -iname "*_rust*.abi3.so" \) | head -20 || true
-          echo "=== _internal (top) ==="; ls "$APP/_internal" 2>/dev/null | head -40 || ls "$APP" | head -40
-
-      - name: Verify exe runs and reports tier=enterprise
-        run: |
-          export YM_BACKEND_PORT=5782
-          export YM_NO_WEBVIEW=1
-          ./dist/youtube-mashina-full/youtube-mashina-full &
-          BACKEND_PID=$!
-          sleep 20
-          echo "=== /api/tier/current ==="
-          TIER_RESP=$(curl -sS --max-time 5 "http://127.0.0.1:5782/api/tier/current" || echo "no response")
-          echo "$TIER_RESP"
-          if echo "$TIER_RESP" | grep -q "enterprise"; then
-            echo "✓ tier=enterprise confirmed"
-          else
-            echo "✗ tier mismatch — FULL build did not resolve to enterprise"
-            kill -9 $BACKEND_PID 2>/dev/null || true
-            exit 1
-          fi
-          kill -9 $BACKEND_PID 2>/dev/null || true
-          wait $BACKEND_PID 2>/dev/null || true
-
-      - name: Package as .dmg
-        run: |
-          mkdir -p dmg-staging
-          cp -r dist/youtube-mashina-full dmg-staging/
-          mv dmg-staging/youtube-mashina-full dmg-staging/YouTubeMashinaFull
-          create-dmg \
-            --volname "YouTube MASHINA FULL" \
-            --window-pos 200 120 \
-            --window-size 700 450 \
-            --icon-size 100 \
-            --app-drop-link 525 225 \
-            --no-internet-enable \
-            "youtube-mashina-full-macos-arm64.dmg" \
-            dmg-staging/ || {
-              echo "create-dmg failed, falling back to zip"
-              cd dmg-staging && zip -9 -r ../youtube-mashina-full-macos-arm64.zip YouTubeMashinaFull && cd ..
-            }
-          ls -lh youtube-mashina-full-macos-arm64.* || true
-
-      - name: Upload as artifact (backup)
-        uses: actions/upload-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: youtube-mashina-full-macos-arm64
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/src-tauri
+
+      - name: Install build dependencies
+        run: |
+          brew install ffmpeg create-dmg
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -r requirements.txt pytest "pyinstaller>=6.0"
+
+      - name: Test packaging helpers
+        run: python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_macos_workflow_contract.py -q
+
+      - name: Bundle ffmpeg and build backend
+        run: |
+          python scripts/bundle_macos_ffmpeg.py --output data/bin
+          test -f configs/config.py || cp configs/config.example.py configs/config.py
+          bash scripts/build_backend.sh
+
+      - name: Stage backend and build Tauri app
+        run: |
+          mkdir -p ui/src-tauri/resources
+          find ui/src-tauri/resources -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          cp -R dist/youtube-mashina-backend/. ui/src-tauri/resources/
+          cd ui
+          npm ci
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("src-tauri/tauri.conf.json")
+          config = json.loads(path.read_text())
+          config["bundle"]["targets"] = ["app"]
+          config["bundle"]["createUpdaterArtifacts"] = False
+          config["bundle"]["macOS"]["minimumSystemVersion"] = "${{ matrix.deployment_target }}"
+          config.setdefault("plugins", {}).setdefault("updater", {})["active"] = False
+          path.write_text(json.dumps(config, indent=2) + "\n")
+          PY
+          npm run tauri:build -- --bundles app --target "${{ matrix.target }}"
+
+      - name: Patch, sign and verify app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          bash scripts/patch_macos_app.sh "${{ matrix.target }}"
+          APP="ui/src-tauri/target/${{ matrix.target }}/release/bundle/macos/YouTube MASHINA.app"
+          python scripts/verify_macos_arch.py --arch "${{ matrix.machine }}" "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Create and verify DMG
+        run: |
+          APP="ui/src-tauri/target/${{ matrix.target }}/release/bundle/macos/YouTube MASHINA.app"
+          mkdir -p release dmg-staging
+          cp -R "$APP" dmg-staging/
+          create-dmg --volname "YouTube MASHINA" --window-size 700 450 --icon-size 100 --app-drop-link 525 225 --no-internet-enable "release/${{ matrix.dmg }}" dmg-staging || hdiutil create -volname "YouTube MASHINA" -srcfolder dmg-staging -ov -format UDZO "release/${{ matrix.dmg }}"
+          hdiutil verify "release/${{ matrix.dmg }}"
+          printf '%s\n' "$SOURCE_SHA" > "release/${{ matrix.dmg }}.source-sha.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: youtube-mashina-macos-${{ matrix.arch }}
           path: |
-            youtube-mashina-full-macos-arm64.dmg
-            youtube-mashina-full-macos-arm64.zip
+            release/${{ matrix.dmg }}
+            release/${{ matrix.dmg }}.source-sha.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish DMG to PUBLIC release (this repo)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  extension:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: notageek88/youtube-mashina
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SRC_PAT }}
+      - name: Package extension
         run: |
-          set -e
-          tag="${{ inputs.ref }}"
-          repo="notageek88/YouTubeMashina"
-          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            gh release create "$tag" --repo "$repo" --prerelease --title "$tag" --generate-notes || true
-          fi
-          ASSET=$(ls youtube-mashina-full-macos-arm64.dmg 2>/dev/null || ls youtube-mashina-full-macos-arm64.zip)
-          echo "Uploading $ASSET to $repo release $tag"
-          gh release upload "$tag" "$ASSET" --repo "$repo" --clobber
+          mkdir -p release
+          python scripts/package_extension.py ui/extension release/YouTube-MASHINA-extension.zip
+          unzip -t release/YouTube-MASHINA-extension.zip
+          printf '%s\n' "${{ needs.resolve.outputs.source_sha }}" > release/YouTube-MASHINA-extension.zip.source-sha.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: youtube-mashina-extension
+          path: |
+            release/YouTube-MASHINA-extension.zip
+            release/YouTube-MASHINA-extension.zip.source-sha.txt
+          if-no-files-found: error
+          retention-days: 30
