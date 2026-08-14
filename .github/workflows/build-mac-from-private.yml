@@ -3,7 +3,7 @@ name: Build Mac from private (two DMGs)
 # Public-runner fallback for the private repository.
 # The build body is synchronized with notageek88/youtube-mashina:
 # .github/workflows/build-mac-tauri.yml
-# Trigger baseline: private source dbe812194d7ec92c508419d388df8560b0fc2bff
+# Trigger baseline: private source 111c1274091ab020e40b8a9883d908e71075a276
 on:
   push:
     branches: [main]
@@ -104,7 +104,7 @@ jobs:
 
       - name: Test packaging helpers and macOS release contracts
         run: |
-          python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_build_macos_ffmpeg.py tests/test_macos_workflow_contract.py tests/test_macos_dependency_floor.py -q
+          python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_build_macos_ffmpeg.py tests/test_build_backend_contract.py tests/test_macos_workflow_contract.py tests/test_macos_dependency_floor.py -q
           python -m unittest tests/test_macos_release_contract.py tests/test_diagnostic_redaction.py tests/test_release_secret_scanner.py tests/test_runtime_config.py tests/test_llm_model_routing.py tests/test_runtime_security.py tests/test_extension_runtime.py -v
           node tests/native_clipboard.test.js
           node tests/license_actions.test.js
