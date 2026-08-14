@@ -3,7 +3,7 @@ name: Build Mac from private (two DMGs)
 # Public-runner fallback for the private repository.
 # The build body is synchronized with notageek88/youtube-mashina:
 # .github/workflows/build-mac-tauri.yml
-# Trigger baseline: private source c8920b0410ea6c0b76e78a31d084a785514ba0d9
+# Trigger baseline: private source 18e5902a1467f1b3056a2fecb0a3faf32110c9f1
 on:
   push:
     branches: [main]
@@ -96,7 +96,7 @@ jobs:
           export LLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm"
           export CMAKE_PREFIX_PATH="$(brew --prefix llvm):${CMAKE_PREFIX_PATH:-}"
           python -m pip install --upgrade pip wheel setuptools
-          python -m pip install -r requirements-full.txt "pyinstaller>=6.0"
+          python -m pip install --only-binary=av,numba,llvmlite -r requirements-full.txt "pyinstaller>=6.0"
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
