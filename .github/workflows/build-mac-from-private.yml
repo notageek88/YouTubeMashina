@@ -3,6 +3,7 @@ name: Build Mac from private (two DMGs)
 # Public-runner fallback for the private repository.
 # The build body is synchronized with notageek88/youtube-mashina:
 # .github/workflows/build-mac-tauri.yml
+# Trigger baseline: private source 77567936a0184754ecf6944bc669eefca5a60c59
 on:
   push:
     branches: [main]
