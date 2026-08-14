@@ -1,5 +1,8 @@
 name: Build Mac from private (two DMGs)
 
+# Public-runner fallback for the private repository.
+# The build body is synchronized with notageek88/youtube-mashina:
+# .github/workflows/build-mac-tauri.yml
 on:
   push:
     branches: [main]
@@ -13,7 +16,8 @@ on:
         default: dev-last-v
 
 env:
-  PRIVATE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'afc1906f4d3e3f848b2266d93812b5633dc5e3e9' }}
+  PRIVATE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'dev-last-v' }}
+
 jobs:
   resolve:
     runs-on: ubuntu-latest
@@ -39,13 +43,13 @@ jobs:
             runner: macos-15-intel
             machine: x86_64
             target: x86_64-apple-darwin
-            deployment_target: "10.13"
+            deployment_target: "13.0"
             dmg: YouTube-MASHINA-macos-x64.dmg
           - arch: arm64
             runner: macos-15
             machine: arm64
             target: aarch64-apple-darwin
-            deployment_target: "11.0"
+            deployment_target: "13.0"
             dmg: YouTube-MASHINA-macos-arm64.dmg
     runs-on: ${{ matrix.runner }}
     env:
@@ -67,7 +71,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements-full.txt
+            requirements.txt
 
       - uses: actions/setup-node@v4
         with:
@@ -85,12 +91,20 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install ffmpeg create-dmg
+          brew install ffmpeg create-dmg llvm
+          export LLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm"
+          export CMAKE_PREFIX_PATH="$(brew --prefix llvm):${CMAKE_PREFIX_PATH:-}"
           python -m pip install --upgrade pip wheel setuptools
-          python -m pip install -r requirements.txt pytest "pyinstaller>=6.0"
+          python -m pip install -r requirements-full.txt "pyinstaller>=6.0"
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
 
-      - name: Test packaging helpers
-        run: python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_macos_workflow_contract.py -q
+      - name: Test packaging helpers and macOS release contracts
+        run: |
+          python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_macos_workflow_contract.py tests/test_macos_dependency_floor.py -q
+          python -m unittest tests/test_macos_release_contract.py tests/test_diagnostic_redaction.py tests/test_release_secret_scanner.py tests/test_runtime_config.py tests/test_llm_model_routing.py tests/test_runtime_security.py tests/test_extension_runtime.py -v
+          node tests/native_clipboard.test.js
+          node tests/license_actions.test.js
 
       - name: Bundle ffmpeg and build backend
         run: |
@@ -103,6 +117,10 @@ jobs:
           mkdir -p ui/src-tauri/resources
           find ui/src-tauri/resources -mindepth 1 -maxdepth 1 -exec rm -rf {} +
           cp -R dist/youtube-mashina-backend/. ui/src-tauri/resources/
+          mkdir -p ui/src-tauri/resources/ui
+          cp -R ui/extension ui/src-tauri/resources/ui/extension
+          test -f ui/src-tauri/resources/ui/extension/manifest.json
+          python tools/check_release_secrets.py ui/src-tauri/resources --allow-embedded-bug-bot
           cd ui
           npm ci
           python3 - <<'PY'
@@ -124,7 +142,8 @@ jobs:
         run: |
           bash scripts/patch_macos_app.sh "${{ matrix.target }}"
           APP="ui/src-tauri/target/${{ matrix.target }}/release/bundle/macos/YouTube MASHINA.app"
-          python scripts/verify_macos_arch.py --arch "${{ matrix.machine }}" "$APP"
+          python scripts/verify_macos_arch.py --arch "${{ matrix.machine }}" --max-min-macos "${{ matrix.deployment_target }}" "$APP"
+          python tools/check_release_secrets.py "$APP" --allow-embedded-bug-bot
           codesign --verify --deep --strict "$APP"
 
       - name: Create and verify DMG
