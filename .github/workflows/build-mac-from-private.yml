@@ -3,7 +3,7 @@ name: Build Mac from private (two DMGs)
 # Public-runner fallback for the private repository.
 # The build body is synchronized with notageek88/youtube-mashina:
 # .github/workflows/build-mac-tauri.yml
-# Trigger baseline: private source 77567936a0184754ecf6944bc669eefca5a60c59
+# Trigger baseline: private source c8920b0410ea6c0b76e78a31d084a785514ba0d9
 on:
   push:
     branches: [main]
@@ -44,13 +44,13 @@ jobs:
             runner: macos-15-intel
             machine: x86_64
             target: x86_64-apple-darwin
-            deployment_target: "13.0"
+            deployment_target: "13.5"
             dmg: YouTube-MASHINA-macos-x64.dmg
           - arch: arm64
             runner: macos-15
             machine: arm64
             target: aarch64-apple-darwin
-            deployment_target: "13.0"
+            deployment_target: "13.5"
             dmg: YouTube-MASHINA-macos-arm64.dmg
     runs-on: ${{ matrix.runner }}
     env:
@@ -92,7 +92,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install ffmpeg create-dmg llvm
+          brew install create-dmg llvm nasm
           export LLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm"
           export CMAKE_PREFIX_PATH="$(brew --prefix llvm):${CMAKE_PREFIX_PATH:-}"
           python -m pip install --upgrade pip wheel setuptools
@@ -102,14 +102,14 @@ jobs:
 
       - name: Test packaging helpers and macOS release contracts
         run: |
-          python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_macos_workflow_contract.py tests/test_macos_dependency_floor.py -q
+          python -m pytest tests/test_verify_macos_arch.py tests/test_package_extension.py tests/test_bundle_macos_ffmpeg.py tests/test_build_macos_ffmpeg.py tests/test_macos_workflow_contract.py tests/test_macos_dependency_floor.py -q
           python -m unittest tests/test_macos_release_contract.py tests/test_diagnostic_redaction.py tests/test_release_secret_scanner.py tests/test_runtime_config.py tests/test_llm_model_routing.py tests/test_runtime_security.py tests/test_extension_runtime.py -v
           node tests/native_clipboard.test.js
           node tests/license_actions.test.js
 
       - name: Bundle ffmpeg and build backend
         run: |
-          python scripts/bundle_macos_ffmpeg.py --output data/bin
+          bash scripts/build_macos_ffmpeg.sh data/bin
           test -f configs/config.py || cp configs/config.example.py configs/config.py
           bash scripts/build_backend.sh
 
