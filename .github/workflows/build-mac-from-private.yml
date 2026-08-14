@@ -3,7 +3,7 @@ name: Build Mac from private (two DMGs)
 # Public-runner fallback for the private repository.
 # The build body is synchronized with notageek88/youtube-mashina:
 # .github/workflows/build-mac-tauri.yml
-# Trigger baseline: private source 18e5902a1467f1b3056a2fecb0a3faf32110c9f1
+# Trigger baseline: private source 4c95f3fdc0aa2d95ac1dfe8d7de4f1f7399ad9e4
 on:
   push:
     branches: [main]
@@ -98,7 +98,7 @@ jobs:
         run: |
           brew install create-dmg nasm
           python -m pip install --upgrade pip wheel setuptools
-          python -m pip install --only-binary=av,numba,llvmlite -r requirements-full.txt "pyinstaller>=6.0"
+          python -m pip install --only-binary=av,numba,llvmlite,sphn -r requirements-full.txt "pyinstaller>=6.0"
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
