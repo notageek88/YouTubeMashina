@@ -92,7 +92,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install create-dmg llvm nasm
+          brew install create-dmg nasm
           python -m pip install --upgrade pip wheel setuptools
           python -m pip install --only-binary=av,numba,llvmlite -r requirements-full.txt "pyinstaller>=6.0"
           python -m pip install -r requirements.txt
