@@ -16,6 +16,10 @@ on:
         required: true
         default: dev-last-v
 
+concurrency:
+  group: build-mac-from-private
+  cancel-in-progress: true
+
 env:
   PRIVATE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'dev-last-v' }}
 
